@@ -64,3 +64,7 @@ msgstr ""
 msgctxt "#30011"
 msgid "Animation speed"
 msgstr ""
+
+msgctxt "#30012"
+msgid "You need to have a folder with images selected! Falling back to defaults."
+msgstr ""

@@ -1,4 +1,7 @@
-#include "xbmc_vis_dll.h"
+#include <kodi/addon-instance/Visualization.h>
+#include <kodi/gui/DialogOK.h>
+#include <kodi/General.h>
+#include <kodi/Filesystem.h>
 
 #include <stdio.h>
 #include <sys/time.h>
@@ -31,9 +34,8 @@ GLuint                 img_tex_ids[3]          =    {};
 
 bool                   update_img              =    false;               // When set to "true", a new image will be crossfaded
 
-char                   presets_root_dir[1024]  =   "";                   // Root directory holding subfolders that will be used
+std::string            presets_root_dir        =   "";                   // Root directory holding subfolders that will be used
                                                                          // as presets and searched for images
-unsigned int           presets_count           =    0;                   // Amount of presets (subfolders) found
 unsigned int           preset_index            =    0;                   // Index of the currently selected preset
 bool                   preset_random           =    false;               // If random preset is active
 bool                   preset_locked           =    false;               // If current preset is locked
@@ -79,274 +81,94 @@ td_map_data     pi_data;        // Map consisting of key = preset-name, value = 
 
 int                     prev_freq_data_length =    0;
 
+
 static const char *img_filter[] = { "*.jpg", "*.png", "*.jpeg" };
 
-static long int get_current_time_ms() {
-    struct timeval current_time;
-    gettimeofday( &current_time, NULL );
+static long int get_current_time_ms()
+{
+  struct timeval current_time;
+  gettimeofday( &current_time, nullptr );
 
-    return current_time.tv_sec * 1000 + current_time.tv_usec / 1000;
+  return current_time.tv_sec * 1000 + current_time.tv_usec / 1000;
 }
 
-// Join file/folder path
-std::string path_join(std::string a, std::string b) {
-    // Apparently Windows does understand a "/" just fine...
-    // Haven't tested it though, but for now I'm just believing it
+class CVisualizationPictureIt
+  : public kodi::addon::CAddonBase,
+    public kodi::addon::CInstanceVisualization
+{
+public:
+  CVisualizationPictureIt();
+  virtual ~CVisualizationPictureIt();
 
-    // a ends with "/"
-    if ( a.substr( a.length() - 1, a.length() ) == "/" )
-        a = a.substr( 0, a.size() - 1 );
+  virtual void Render() override;
+  virtual void AudioData(const float* audioData, int audioDataLength, float *freqData, int freqDataLength) override;
+  virtual ADDON_STATUS SetSetting(const std::string& settingName, const kodi::CSettingValue& settingValue) override;
 
-    // b starts with "/"
-    if ( b.substr( 0, 1 ) == "/" )
-        b = b.substr( 1, b.size() );
+  virtual bool GetPresets(std::vector<std::string>& presets) override;
+  virtual int GetActivePreset() override;
+  virtual bool IsLocked() override;
+  virtual bool PrevPreset() override;
+  virtual bool NextPreset() override;
+  virtual bool LoadPreset(int select) override;
+  virtual bool RandomPreset() override;
+  virtual bool LockPreset(bool lockUnlock) override;
+  virtual bool UpdateTrack(const VisTrack& track) override;
+    
+private:
+  void SetBottomEdgeSetting(int settingValue);
+  void SetAnimationSpeedSetting(int settingValue);
 
-    // b ends with "/"
-    if ( b.substr( b.length() - 1, b.length() ) == "/" )
-        b = b.substr( 0, b.size() -1 );
+  std::string path_join(std::string a, std::string b);
+  int list_dir(const char *path, td_vec_str &store, bool recursive = false, bool incl_full_path = true, int filter_size = 0, const char *file_filter[] = nullptr);
+  int get_next_img_pos();
+  void load_data(const char* path);
+  void select_preset(unsigned int index);
+  GLuint load_image(GLuint img_tex_id = 0);
+  void draw_image(GLuint img_tex_id, float opacity);
+  void draw_bars(int i, GLfloat x1, GLfloat x2);
+  void start_render();
+  void finish_render();
+};
 
-    return a + "/" + b;
+//-- Create -------------------------------------------------------------------
+// Called on load. Addon should fully initalize or return error status
+//-----------------------------------------------------------------------------
+CVisualizationPictureIt::CVisualizationPictureIt()
+{
+  // Seed the psuedo-random number generator
+  std::srand(time(0));
+
+  presets_root_dir = kodi::GetSettingString("presets_root_dir");
+  if (presets_root_dir.empty())
+    presets_root_dir = kodi::GetAddonPath() + "/resources/pictures";
+  update_on_new_track = kodi::GetSettingBoolean("update_on_new_track");
+  update_by_interval = kodi::GetSettingBoolean("update_on_new_track");
+  img_update_interval = kodi::GetSettingInt("img_update_interval");
+  fade_time_ms = kodi::GetSettingInt("fade_time_ms");
+  vis_enabled = kodi::GetSettingBoolean("vis_enabled");
+  vis_bg_enabled = kodi::GetSettingBoolean("vis_bg_enabled");
+  vis_width = (kodi::GetSettingInt("vis_half_width") * 1.0f / 100);
+  SetBottomEdgeSetting(kodi::GetSettingInt("vis_bottom_edge"));
+  SetAnimationSpeedSetting(kodi::GetSettingInt("vis_animation_speed"));
+
+  load_data( presets_root_dir.c_str() );
+  select_preset( (rand() % pi_presets.size()) );
 }
 
-// List the contents of a directory (excluding "." files/folders)
-int list_dir(const char *path, td_vec_str &store, bool recursive = false, bool incl_full_path = true, int filter_size = 0, const char *file_filter[] = NULL ) {
-    std::string p = path;
-    struct dirent *entry;
-    DIR *dp;
-
-    dp = opendir(path);
-    if (dp == NULL)
-        return false;
-
-    bool add = false;
-    char* name;
-    while ((entry = readdir(dp))) {
-        name = entry->d_name;
-
-        if ( entry->d_type == DT_DIR && name && name[0] != '.' ) {
-            if ( ! file_filter )
-                add = true;
-
-            if ( recursive )
-                list_dir( path_join( p, name).c_str(), store, recursive, incl_full_path, filter_size, file_filter );
-        } else if ( entry->d_type != DT_DIR && name && name[0] != '.' ) {
-            if ( file_filter ) {
-                for ( unsigned int i = 0; i < filter_size / sizeof( file_filter[0] ); i++) {
-                    if ( fnmatch( file_filter[i], name, FNM_CASEFOLD ) == 0) {
-                        add = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if ( add ) {
-            if ( incl_full_path )
-                store.push_back( path_join( p, name ).c_str() );
-            else
-                store.push_back( name );
-            add = false;
-        }
-    }
-
-    closedir(dp);
-    return 0;
-}
-
-int get_next_img_pos() {
-    if ( (unsigned)img_current_pos < ( pi_images.size()-1 ) )
-        img_current_pos++;
-    else
-        img_current_pos = 0;
-    return img_current_pos;
-}
-
-// Load presets and all associated images
-void load_data( const char* path ) {
-    if ( path && !path[0] )
-        return;
-
-    list_dir( path, pi_presets, false, false, 0, NULL );
-    std::sort( pi_presets.begin(), pi_presets.end() );
-
-
-    td_vec_str images;
-
-    if ( ! pi_presets.empty() ) {
-        for ( unsigned int i = 0; i < pi_presets.size(); i++ ) {
-            list_dir( path_join( path, pi_presets[i] ).c_str(), images, true, true, sizeof(img_filter), img_filter );
-
-            // Preset empty or can't be accessed
-            if ( images.size() <= 0 ) {
-                pi_presets.erase(pi_presets.begin() + i);
-                continue;
-            }
-
-            // Randomize our new image-set
-            std::random_shuffle( images.begin(), images.end() );
-
-            pi_data[pi_presets[i]] = images;
-
-            images.clear();
-        }
-
-    } else {
-        // No presets found, let's see if we can't find images in the root-dir
-        // itself and add it to a "Default" preset
-        pi_presets.push_back( "Default" );
-        list_dir( path, images, true, true, sizeof(img_filter), img_filter );
-
-        std::random_shuffle( images.begin(), images.end() );
-
-        pi_data[pi_presets[0]] = images;
-
-        images.clear();
-    }
-}
-
-// Select preset at "index"
-void select_preset( unsigned int index ) {
-    if ( index >= pi_presets.size() )
-        return;
-
-    preset_index = index;
-    pi_images = pi_data[ pi_presets[preset_index] ];
-
-    update_img = true;
-}
-
-// Load an image into an OpenGL texture and return the texture-id
-GLuint load_image( GLuint img_tex_id = 0 ) {
-    if ( pi_images.empty() )
-        return 0;
-
-    int x, y, n;
-    unsigned char *data = stbi_load(pi_images[get_next_img_pos()].c_str(), &x, &y, &n, 0);
-
-    if(data == nullptr)
-        return 0;
-
-    GLuint texture[1];
-    glGenTextures(1, texture);
-
-    glBindTexture(GL_TEXTURE_2D, texture[0]);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x, y, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-
-    stbi_image_free(data);
-
-    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,  GL_LINEAR );
-    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,  GL_LINEAR );
-    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,      GL_CLAMP_TO_EDGE );
-    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,      GL_CLAMP_TO_EDGE );
-
-    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_DECAL);
-
-    return texture[0];
-}
-
-// Draw the image with a certain opacity (opacity is used to cross-fade two images)
-void draw_image( GLuint img_tex_id, float opacity ) {
-    if ( ! img_tex_id )
-        return;
-
-    glEnable( GL_TEXTURE_2D );
-    glEnable( GL_BLEND );
-
-    glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
-
-    glBindTexture( GL_TEXTURE_2D, img_tex_id );
-
-    if ( ! img_tex_id )
-        glColor4f( 0.0f, 0.0f, 0.0f, opacity );
-    else
-        glColor4f( 1.0f, 1.0f, 1.0f, opacity );
-
-    glBegin( GL_QUADS );
-        glTexCoord2f( 0.0f, 0.0f ); glVertex2f( -1.0f, -1.0f );  // Top Left
-        glTexCoord2f( 1.0f, 0.0f ); glVertex2f(  1.0f, -1.0f );  // Top Right
-        glTexCoord2f( 1.0f, 1.0f ); glVertex2f(  1.0f,  1.0f );  // Bottom Right
-        glTexCoord2f( 0.0f, 1.0f ); glVertex2f( -1.0f,  1.0f );  // Bottom Left
-    glEnd();
-
-    glDisable( GL_TEXTURE_2D );
-    glDisable( GL_BLEND );
-}
-
-// Draw a single bar
-//   i = index of the bar from left to right
-//   x1 + x2 = width and position of the bar
-void draw_bars( int i, GLfloat x1, GLfloat x2 ) {
-
-    if ( ::fabs( cvis_bar_heights[i] - vis_bar_heights[i] ) > 0 ) {
-        // The bigger the difference between the current and previous heights, the faster
-        // we want the bars to move.
-        // The "10.0" is a random value I choose after some testing.
-        float gravity = ::fabs( cvis_bar_heights[i] - pvis_bar_heights[i] ) / 10.0;
-
-        if ( cvis_bar_heights[i] < vis_bar_heights[i] )
-            cvis_bar_heights[i] += vis_animation_speed + gravity;
-        else
-            cvis_bar_heights[i] -= vis_animation_speed + gravity;
-    }
-
-    pvis_bar_heights[i] = vis_bar_heights[i];
-    GLfloat y2 = vis_bottom_edge - cvis_bar_heights[i];
-
-    glBegin(GL_QUADS);
-        glVertex2f( x1, y2 );               // Top Left
-        glVertex2f( x2, y2 );               // Top Right
-        glVertex2f( x2, vis_bottom_edge );  // Bottom Right
-        glVertex2f( x1, vis_bottom_edge );  // Bottom Left
-    glEnd();
-
-    // This is the mirrored part on the right side
-    glBegin(GL_QUADS);
-        glVertex2f( -x2, y2 );               // Top Left
-        glVertex2f( -x1, y2 );               // Top Right
-        glVertex2f( -x1, vis_bottom_edge );  // Bottom Right
-        glVertex2f( -x2, vis_bottom_edge );  // Bottom Left
-    glEnd();
-}
-
-// Some initial OpenGL stuff
-void start_render() {
-    // save OpenGL original state
-    glPushAttrib( GL_ENABLE_BIT | GL_TEXTURE_BIT );
-
-    // Clear The Screen And The Depth Buffer
-    glClear( GL_COLOR_BUFFER_BIT );
-
-    // OpenGL projection matrix setup
-    glMatrixMode( GL_PROJECTION );
-    glPushMatrix();
-    glLoadIdentity();
-
-    // Coordinate-System:
-    //     screen top left:     ( -1, -1 )
-    //     screen center:       (  0,  0 )
-    //     screen bottom right: (  1,  1 )
-    glOrtho( -1, 1, 1, -1, -1, 1 );
-
-    glMatrixMode( GL_MODELVIEW );
-    glPushMatrix();
-    glLoadIdentity();
-}
-
-// Finishing off OpenGl
-void finish_render() {
-    // return OpenGL matrices to original state
-    glPopMatrix();
-    glMatrixMode( GL_PROJECTION );
-    glPopMatrix();
-
-    // restore OpenGl original state
-    glPopAttrib();
+CVisualizationPictureIt::~CVisualizationPictureIt()
+{
+  for (auto ptr : pi_data)
+  {
+    ptr.second.clear();
+  }
+  pi_data.clear();
 }
 
 //-- Render -------------------------------------------------------------------
 // Called once per frame. Do all rendering here.
 //-----------------------------------------------------------------------------
-extern "C" void Render() {
+void CVisualizationPictureIt::Render()
+{
     start_render();
 
     // reached next update-intervall
@@ -442,30 +264,6 @@ extern "C" void Render() {
     finish_render();
 }
 
-//-- Create -------------------------------------------------------------------
-// Called on load. Addon should fully initalize or return error status
-//-----------------------------------------------------------------------------
-ADDON_STATUS ADDON_Create( void* hdl, void* props ) {
-    if ( ! props )
-        return ADDON_STATUS_UNKNOWN;
-
-    // Seed the psuedo-random number generator
-    std::srand( time(0) );
-
-    return ADDON_STATUS_NEED_SETTINGS;
-}
-
-extern "C" void Start(int iChannels, int iSamplesPerSec, int iBitsPerSample, const char* szSongName) {
-    // Now we should have the user-settings loaded so we can try and get our data (presets/images)
-    if ( pi_data.empty() ) {
-        load_data( presets_root_dir );
-
-        // If we have some data, we select a random preset
-        if ( ! pi_data.empty() )
-            select_preset( (rand() % pi_presets.size()) );
-    }
-}
-
 // The includes and variables are defined here just because I'm still not too keen on the whole
 // rfft thing
 // At some point it might make sense to switch to FFTW for better performance once a proper spectrum
@@ -474,7 +272,8 @@ extern "C" void Start(int iChannels, int iSamplesPerSec, int iBitsPerSample, con
 #include <memory>
 
 std::unique_ptr<MRFFT> m_transform;
-extern "C" void AudioData(const float* pAudioData, int iAudioDataLength, float *pFreqData, int iFreqDataLength) {
+void CVisualizationPictureIt::AudioData(const float* pAudioData, int iAudioDataLength, float *pFreqData, int iFreqDataLength)
+{
     if ( ! vis_enabled )
         return;
 
@@ -513,205 +312,417 @@ extern "C" void AudioData(const float* pAudioData, int iAudioDataLength, float *
     }
 }
 
-
-//-- GetInfo ------------------------------------------------------------------
-// Tell XBMC our requirements
-//-----------------------------------------------------------------------------
-extern "C" void GetInfo(VIS_INFO* pInfo) {
-    // We do the fft ourself because Kodi doesn't do windowing beforehand
-    pInfo->bWantsFreq = false;
-    pInfo->iSyncDelay = 0;
-}
-
-
-//-- GetSubModules ------------------------------------------------------------
-// Return any sub modules supported by this vis
-//-----------------------------------------------------------------------------
-extern "C" unsigned int GetSubModules(char ***names) {
-    return 0;
-}
-
 //-- OnAction -----------------------------------------------------------------
 // Handle XBMC actions such as next preset, lock preset, album art changed etc
 //-----------------------------------------------------------------------------
-extern "C" bool OnAction(long flags, const void *param) {
-    bool ret = true;
 
-    switch ( flags ) {
-        case VIS_ACTION_LOAD_PRESET:
-            if ( param )
-                select_preset( (*( (int*) param )) );
-            else
-                ret = false;
-            break;
-        case VIS_ACTION_NEXT_PRESET:
-            if ( ! preset_locked ) {
-                if ( preset_random ) {
-                        select_preset( rand() % pi_presets.size() );
-                } else {
-                    preset_index += 1;
-                    if ( preset_index >= pi_presets.size() )
-                        preset_index = 0;
-                }
-            }
-            break;
-        case VIS_ACTION_PREV_PRESET:
-            if ( ! preset_locked ) {
-                if ( preset_random ) {
-                        select_preset( rand() % pi_presets.size() );
-                } else {
-                    preset_index -= 1;
-                    if ( preset_index < 0 )
-                        preset_index = pi_presets.size();
-                }
-            }
-            break;
-        case VIS_ACTION_RANDOM_PRESET:
-            preset_random = !preset_random;
-            break;
-        case VIS_ACTION_LOCK_PRESET:
-            preset_locked = !preset_locked;
-            break;
-        case VIS_ACTION_UPDATE_TRACK:
-            if ( update_on_new_track )
-                update_img = true;
-            break;
-        default:
-            ret = false;
+bool CVisualizationPictureIt::PrevPreset()
+{
+  if (!preset_locked)
+  {
+    if (preset_random)
+    {
+      select_preset(rand() % pi_presets.size());
     }
+    else 
+    {
+      preset_index -= 1;
+      if (preset_index < 0)
+        preset_index = pi_presets.size();
+    }
+  }
+  return true;
+}
 
-    return ret;
+bool CVisualizationPictureIt::NextPreset()
+{
+  if (!preset_locked)
+  {
+    if (preset_random)
+    {
+      select_preset(rand() % pi_presets.size());
+    }
+    else
+    {
+      preset_index += 1;
+      if (preset_index >= pi_presets.size())
+        preset_index = 0;
+    }
+  }
+  return true;
+}
+  
+bool CVisualizationPictureIt::LoadPreset(int select)
+{
+  select_preset(select);
+  return true;
+}
+
+bool CVisualizationPictureIt::RandomPreset()
+{
+  preset_random = !preset_random;
+  return true;
+}
+
+bool CVisualizationPictureIt::LockPreset(bool lockUnlock)
+{
+  preset_locked = lockUnlock;
+  return true;
+}
+
+bool CVisualizationPictureIt::UpdateTrack(const VisTrack &track)
+{
+  if (update_on_new_track)
+    update_img = true;
+  return true;
 }
 
 //-- GetPresets ---------------------------------------------------------------
 // Return a list of presets to XBMC for display
 //-----------------------------------------------------------------------------
-extern "C" unsigned int GetPresets(char ***presets) {
-    if ( pi_data.empty() )
-        load_data( presets_root_dir );
+bool CVisualizationPictureIt::GetPresets(std::vector<std::string>& presets)
+{
+  if ( pi_data.empty() )
+    load_data( presets_root_dir.c_str() );
 
-    if ( pi_data.empty() )
-        return 0;
+  if ( pi_data.empty() )
+    return 0;
 
-    presets_count = pi_presets.size();
-    char **g_presets = (char**) malloc( sizeof(char*) * presets_count );
+  unsigned int presets_count = pi_presets.size();
+  for (unsigned int i = 0; i < presets_count; ++i)
+    presets.push_back(pi_presets[i]);
 
-    for( unsigned int i = 0; i < presets_count; i++ )
-        g_presets[i] = (char*) pi_presets[i].c_str();
-
-    *presets = g_presets;
-
-    return presets_count;
+  return (presets_count > 0) ? true : false;
 }
 
-//-- GetPreset ----------------------------------------------------------------
+
+//-- GetActivePreset ----------------------------------------------------------
 // Return the index of the current playing preset
 //-----------------------------------------------------------------------------
-extern "C" unsigned GetPreset() {
-    return preset_index;
+int CVisualizationPictureIt::GetActivePreset()
+{
+  return static_cast<int>(preset_index);
 }
 
 //-- IsLocked -----------------------------------------------------------------
 // Returns true if this add-on use settings
 //-----------------------------------------------------------------------------
-extern "C" bool IsLocked() {
-    return preset_locked;
+bool CVisualizationPictureIt::IsLocked()
+{
+  return preset_locked;
 }
 
-//-- Stop ---------------------------------------------------------------------
-// This dll must cease all runtime activities
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" void ADDON_Stop() {}
-
-//-- Destroy ------------------------------------------------------------------
-// Do everything before unload of this add-on
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" void ADDON_Destroy() {}
-
-//-- HasSettings --------------------------------------------------------------
-// Returns true if this add-on use settings
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" bool ADDON_HasSettings() {
-    return true;
+void CVisualizationPictureIt::SetBottomEdgeSetting(int settingValue)
+{
+  float scale[] = { 1.0, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80 };
+  vis_bottom_edge = scale[settingValue];
 }
 
-//-- GetStatus ---------------------------------------------------------------
-// Returns the current Status of this visualisation
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" ADDON_STATUS ADDON_GetStatus() {
-    return ADDON_STATUS_OK;
+void CVisualizationPictureIt::SetAnimationSpeedSetting(int settingValue)
+{
+  vis_animation_speed = settingValue * 0.005f / 100;
 }
-
-//-- GetSettings --------------------------------------------------------------
-// Return the settings for XBMC to display
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" unsigned int ADDON_GetSettings(ADDON_StructSetting ***sSet) {
-    return 0;
-}
-
-//-- FreeSettings --------------------------------------------------------------
-// Free the settings struct passed from XBMC
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-
-extern "C" void ADDON_FreeSettings() {}
 
 //-- SetSetting ---------------------------------------------------------------
 // Set a specific Setting value (called from XBMC)
 // !!! Add-on master function !!!
 //-----------------------------------------------------------------------------
-extern "C" ADDON_STATUS ADDON_SetSetting( const char *strSetting, const void* value ) {
-    if ( ! strSetting || ! value )
-        return ADDON_STATUS_UNKNOWN;
-
-    std::string str = strSetting;
-
-    if ( str == "presets_root_dir" ) {
-        const char* dir = (const char*) value;
-        if ( dir && !dir[0] )
-            return ADDON_STATUS_NEED_SETTINGS;
-        strcpy( presets_root_dir, (const char*) value );
+ADDON_STATUS CVisualizationPictureIt::SetSetting(const std::string& settingName, const kodi::CSettingValue& settingValue)
+{
+  if (settingName == "presets_root_dir")
+  {
+    std::string dir = settingValue.GetString();
+    if (dir.empty())
+    {
+      kodi::gui::DialogOK::ShowAndGetInput(kodi::GetLocalizedString(257), kodi::GetLocalizedString(30012));
+      dir = kodi::GetAddonPath() + "/resources/pictures";
     }
+    presets_root_dir = dir;
+  }
+  else if (settingName == "update_on_new_track")
+    update_on_new_track = settingValue.GetBoolean();
+  else if (settingName == "update_by_interval")
+    update_by_interval = settingValue.GetBoolean();
+  else if (settingName == "img_update_interval")
+    img_update_interval = settingValue.GetInt();
+  else if (settingName == "fade_time_ms")
+    fade_time_ms = settingValue.GetInt();
+  else if (settingName == "vis_enabled")
+    vis_enabled = settingValue.GetBoolean();
+  else if (settingName == "vis_bg_enabled" )
+    vis_bg_enabled = settingValue.GetBoolean();
+  else if (settingName == "vis_half_width")
+    vis_width = (settingValue.GetInt() * 1.0f / 100);
+  else if (settingName == "vis_bottom_edge")
+    SetBottomEdgeSetting(settingValue.GetInt());
+  else if (settingName == "vis_animation_speed")
+    SetAnimationSpeedSetting(settingValue.GetInt());
 
-    if ( str == "update_on_new_track" )
-        update_on_new_track = *(bool*)value;
-
-    if ( str == "update_by_interval" )
-        update_by_interval = *(bool*)value;
-
-    if ( str == "img_update_interval" )
-        img_update_interval = *(int*) value;
-
-    if ( str == "fade_time_ms" )
-        fade_time_ms = *(int*) value;
-
-    if ( str == "vis_enabled" )
-        vis_enabled = *(bool*)value;
-
-    if ( str == "vis_bg_enabled" )
-        vis_bg_enabled = *(bool*)value;
-
-    if ( str == "vis_half_width" )
-        vis_width = ((*(int*) value) * 1.0f / 100);
-
-    if ( str == "vis_bottom_edge" ) {
-        float scale[] = { 1.0, 0.98, 0.96, 0.94, 0.92, 0.90, 0.88, 0.86, 0.84, 0.82, 0.80 };
-        vis_bottom_edge = scale[(*(int*) value)];
-    }
-
-    if ( str == "vis_animation_speed" )
-        vis_animation_speed = (*(int*) value) * 0.005f / 100;
-
-    return ADDON_STATUS_OK;
+  return ADDON_STATUS_OK;
 }
 
-//-- Announce -----------------------------------------------------------------
-// Receive announcements from XBMC
-// !!! Add-on master function !!!
-//-----------------------------------------------------------------------------
-extern "C" void ADDON_Announce( const char *flag, const char *sender, const char *message, const void *pi_data ) {}
+// Join file/folder path
+std::string CVisualizationPictureIt::path_join(std::string a, std::string b)
+{
+  // Apparently Windows does understand a "/" just fine...
+  // Haven't tested it though, but for now I'm just believing it
+
+  // a ends with "/"
+  if ( a.substr( a.length() - 1, a.length() ) == "/" )
+    a = a.substr( 0, a.size() - 1 );
+
+  // b starts with "/"
+  if ( b.substr( 0, 1 ) == "/" )
+    b = b.substr( 1, b.size() );
+
+  // b ends with "/"
+  if ( b.substr( b.length() - 1, b.length() ) == "/" )
+    b = b.substr( 0, b.size() -1 );
+
+  return a + "/" + b;
+}
+
+// List the contents of a directory (excluding "." files/folders)
+int CVisualizationPictureIt::list_dir(const char *path, td_vec_str &store, bool recursive, bool incl_full_path, int filter_size, const char *file_filter[])
+{
+    std::string p = path;
+    struct dirent *entry;
+    DIR *dp;
+
+    dp = opendir(path);
+    if (dp == nullptr)
+        return false;
+
+    bool add = false;
+    char* name;
+    while ((entry = readdir(dp))) {
+        name = entry->d_name;
+
+        if ( entry->d_type == DT_DIR && name && name[0] != '.' ) {
+            if ( ! file_filter )
+                add = true;
+
+            if ( recursive )
+                list_dir( path_join( p, name).c_str(), store, recursive, incl_full_path, filter_size, file_filter );
+        } else if ( entry->d_type != DT_DIR && name && name[0] != '.' ) {
+            if ( file_filter ) {
+                for ( unsigned int i = 0; i < filter_size / sizeof( file_filter[0] ); i++) {
+                    if ( fnmatch( file_filter[i], name, FNM_CASEFOLD ) == 0) {
+                        add = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ( add ) {
+            if ( incl_full_path )
+                store.push_back( path_join( p, name ).c_str() );
+            else
+                store.push_back( name );
+            add = false;
+        }
+    }
+
+    closedir(dp);
+    return 0;
+}
+
+int CVisualizationPictureIt::get_next_img_pos()
+{
+  if ( (unsigned)img_current_pos < ( pi_images.size()-1 ) )
+    img_current_pos++;
+  else
+    img_current_pos = 0;
+  return img_current_pos;
+}
+// Load presets and all associated images
+void CVisualizationPictureIt::load_data( const char* path )
+{
+    if ( path && !path[0] )
+        return;
+
+    list_dir( path, pi_presets, false, false, 0, NULL );
+    std::sort( pi_presets.begin(), pi_presets.end() );
+
+
+    td_vec_str images;
+
+    if ( ! pi_presets.empty() ) {
+        for ( unsigned int i = 0; i < pi_presets.size(); i++ ) {
+            list_dir( path_join( path, pi_presets[i] ).c_str(), images, true, true, sizeof(img_filter), img_filter );
+
+            // Preset empty or can't be accessed
+            if ( images.size() <= 0 ) {
+                pi_presets.erase(pi_presets.begin() + i);
+                continue;
+            }
+
+            // Randomize our new image-set
+            std::random_shuffle( images.begin(), images.end() );
+
+            pi_data[pi_presets[i]] = images;
+
+            images.clear();
+        }
+
+    } else {
+        // No presets found, let's see if we can't find images in the root-dir
+        // itself and add it to a "Default" preset
+        pi_presets.push_back( "Default" );
+        list_dir( path, images, true, true, sizeof(img_filter), img_filter );
+
+        std::random_shuffle( images.begin(), images.end() );
+
+        pi_data[pi_presets[0]] = images;
+
+        images.clear();
+    }
+}
+
+// Select preset at "index"
+void CVisualizationPictureIt::select_preset(unsigned int index)
+{
+    if ( index >= pi_presets.size() )
+        return;
+
+    preset_index = index;
+    pi_images = pi_data[ pi_presets[preset_index] ];
+
+    update_img = true;
+}
+
+// Load an image into an OpenGL texture and return the texture-id
+GLuint CVisualizationPictureIt::load_image(GLuint img_tex_id)
+{
+    if ( pi_images.empty() )
+        return 0;
+
+    int x, y, n;
+    unsigned char *data = stbi_load(pi_images[get_next_img_pos()].c_str(), &x, &y, &n, 0);
+
+    if(data == nullptr)
+        return 0;
+
+    GLuint texture[1];
+    glGenTextures(1, texture);
+
+    glBindTexture(GL_TEXTURE_2D, texture[0]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x, y, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+
+    stbi_image_free(data);
+
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,  GL_LINEAR );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,  GL_LINEAR );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,      GL_CLAMP_TO_EDGE );
+    glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,      GL_CLAMP_TO_EDGE );
+
+    glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_DECAL);
+
+    return texture[0];
+}
+
+// Draw the image with a certain opacity (opacity is used to cross-fade two images)
+void CVisualizationPictureIt::draw_image(GLuint img_tex_id, float opacity)
+{
+    if ( ! img_tex_id )
+        return;
+
+    glEnable( GL_TEXTURE_2D );
+    glEnable( GL_BLEND );
+
+    glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+
+    glBindTexture( GL_TEXTURE_2D, img_tex_id );
+
+    if ( ! img_tex_id )
+        glColor4f( 0.0f, 0.0f, 0.0f, opacity );
+    else
+        glColor4f( 1.0f, 1.0f, 1.0f, opacity );
+
+    glBegin( GL_QUADS );
+        glTexCoord2f( 0.0f, 0.0f ); glVertex2f( -1.0f, -1.0f );  // Top Left
+        glTexCoord2f( 1.0f, 0.0f ); glVertex2f(  1.0f, -1.0f );  // Top Right
+        glTexCoord2f( 1.0f, 1.0f ); glVertex2f(  1.0f,  1.0f );  // Bottom Right
+        glTexCoord2f( 0.0f, 1.0f ); glVertex2f( -1.0f,  1.0f );  // Bottom Left
+    glEnd();
+
+    glDisable( GL_TEXTURE_2D );
+    glDisable( GL_BLEND );
+}
+
+// Draw a single bar
+//   i = index of the bar from left to right
+//   x1 + x2 = width and position of the bar
+void CVisualizationPictureIt::draw_bars(int i, GLfloat x1, GLfloat x2)
+{
+
+    if ( ::fabs( cvis_bar_heights[i] - vis_bar_heights[i] ) > 0 ) {
+        // The bigger the difference between the current and previous heights, the faster
+        // we want the bars to move.
+        // The "10.0" is a random value I choose after some testing.
+        float gravity = ::fabs( cvis_bar_heights[i] - pvis_bar_heights[i] ) / 10.0;
+
+        if ( cvis_bar_heights[i] < vis_bar_heights[i] )
+            cvis_bar_heights[i] += vis_animation_speed + gravity;
+        else
+            cvis_bar_heights[i] -= vis_animation_speed + gravity;
+    }
+
+    pvis_bar_heights[i] = vis_bar_heights[i];
+    GLfloat y2 = vis_bottom_edge - cvis_bar_heights[i];
+
+    glBegin(GL_QUADS);
+        glVertex2f( x1, y2 );               // Top Left
+        glVertex2f( x2, y2 );               // Top Right
+        glVertex2f( x2, vis_bottom_edge );  // Bottom Right
+        glVertex2f( x1, vis_bottom_edge );  // Bottom Left
+    glEnd();
+
+    // This is the mirrored part on the right side
+    glBegin(GL_QUADS);
+        glVertex2f( -x2, y2 );               // Top Left
+        glVertex2f( -x1, y2 );               // Top Right
+        glVertex2f( -x1, vis_bottom_edge );  // Bottom Right
+        glVertex2f( -x2, vis_bottom_edge );  // Bottom Left
+    glEnd();
+}
+
+// Some initial OpenGL stuff
+void CVisualizationPictureIt::start_render()
+{
+    // save OpenGL original state
+    glPushAttrib( GL_ENABLE_BIT | GL_TEXTURE_BIT );
+
+    // Clear The Screen And The Depth Buffer
+    glClear( GL_COLOR_BUFFER_BIT );
+
+    // OpenGL projection matrix setup
+    glMatrixMode( GL_PROJECTION );
+    glPushMatrix();
+    glLoadIdentity();
+
+    // Coordinate-System:
+    //     screen top left:     ( -1, -1 )
+    //     screen center:       (  0,  0 )
+    //     screen bottom right: (  1,  1 )
+    glOrtho( -1, 1, 1, -1, -1, 1 );
+
+    glMatrixMode( GL_MODELVIEW );
+    glPushMatrix();
+    glLoadIdentity();
+}
+
+// Finishing off OpenGl
+void CVisualizationPictureIt::finish_render()
+{
+    // return OpenGL matrices to original state
+    glPopMatrix();
+    glMatrixMode( GL_PROJECTION );
+    glPopMatrix();
+
+    // restore OpenGl original state
+    glPopAttrib();
+}
+
+ADDONCREATOR(CVisualizationPictureIt)

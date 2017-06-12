@@ -25,6 +25,9 @@ add_subdirectory(lib/kissfft)
 set(PICTUREIT_SOURCES src/mrfft.cpp
                       src/pictureit.cpp)
 
+set(PICTUREIT_HEADERS src/mrfft.h
+                      src/stb_image.h)
+
 list(APPEND DEPLIBS kissfft)
 
 if(APPLE)
